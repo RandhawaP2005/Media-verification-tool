@@ -1,11 +1,18 @@
 volumes:
   minio_data:
+  pgdata:
 
 services: 
   backend:
     build: ./app
     ports: 
       - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - minio
+      - postgresdb
+
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
   minio:
@@ -15,8 +22,21 @@ services:
       - "9000:9000"
       - "9001:9001"
     environment: 
-      MINIO_ROOT_USER: admin
-      MINIO_ROOT_PASSWORD: password
+      MINIO_ROOT_USER: ${MINIO_CLIENT_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_CLIENT_SECRET_KEY}
     volumes:
       - minio_data:/data
     command: server /data --console-address ":9001"
+
+  postgresdb:
+    container_name: postgresdb
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGREDB_NAME}
+      POSTGRES_USER: ${POSTGRESDB_USER}
+      POSTGRES_PASSWORD: ${POSTGRESDB_PASS}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
