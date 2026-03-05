@@ -8,7 +8,8 @@ from database import  engine, SessionLocal
 from sqlalchemy.orm import Session
 from database_models import MediaRecord, Base
 from hashlib import sha256
-import os
+from metadata_handler import sign_img, get_manifest, get_validation_diagnostics
+import os, io
 
 load_dotenv()
 
@@ -49,13 +50,20 @@ def get_sha256_hash(download) -> str:
 def get_img(bucket_name:str, object_name:str) -> bytes:
     try:
         response = client.get_object(bucket_name=bucket_name, object_name=object_name)
-        return get_sha256_hash(response)
+        return response.read()
     except S3Error as e:
         raise RuntimeError(f"Minio get object failed: {e.code} {e.message}") from e
     finally:
         if response:
             response.close()
             response.release_conn()
+
+
+def normalize_c2pa_format(content_type: str) -> str:
+    # c2pa format expects standard mime values (e.g. image/jpeg, not image/jpg)
+    if content_type == "image/jpg":
+        return "image/jpeg"
+    return content_type
 
 
 
@@ -84,15 +92,37 @@ async def upload_image(file: UploadFile, db:Session = Depends(get_db)):
             content_type= file.content_type
         )
 
-        minio_file_hash = get_img(bucket_name="test", object_name=object_key)
+        minio_file = get_img(bucket_name="test", object_name=object_key)
 
-        db.add(MediaRecord(
-            image_id=image_id,
-            bucket="test",
-            object_key=object_key,
-            sha256_bytes=minio_file_hash,
-        ))
+        c2pa_format = normalize_c2pa_format(file.content_type)
+        signed_minio_file = sign_img(format=c2pa_format, input=io.BytesIO(minio_file))
+
+        client.put_object(
+            bucket_name = "test",
+            object_name= f"test/2026/02/{image_id}_signed.{ext}",
+            data = io.BytesIO(signed_minio_file),
+            length = len(signed_minio_file),
+            content_type = file.content_type
+        )
+
+        manifest = get_manifest(io.BytesIO(signed_minio_file), c2pa_format)
+        diagnostics = get_validation_diagnostics(io.BytesIO(signed_minio_file), c2pa_format)
+        print({"manifest": manifest, "diagnostics": diagnostics})
+        #
+        #db.add(MediaRecord(
+        #   image_id=image_id,
+        #    bucket="test",
+        #    object_key=object_key,
+        #    sha256_bytes=minio_file_hash,
+        #))
 
         db.commit()
 
-        return "Upload successful."
+        return {
+            "message": "Upload successful.",
+            "signed_object_key": f"test/2026/02/{image_id}_signed.{ext}",
+            "integrity_valid": diagnostics.get("integrity_valid"),
+            "trust_valid": diagnostics.get("trust_valid"),
+            "manifest": manifest,
+            "diagnostics": diagnostics,
+        }
