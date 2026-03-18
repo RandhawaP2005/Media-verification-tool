@@ -1,5 +1,7 @@
+from datetime import datetime
 import io
 import json
+import uuid
 import c2pa
 import os
 from cryptography.hazmat.primitives import hashes, serialization
@@ -12,28 +14,69 @@ with open("signing.key", "rb") as key_file:
     key = key_file.read()
 TSA_URL = os.getenv("C2PA_TSA_URL")
 
-def create_manifest(format:str):
-    manifest_definition = {
-        "claim_generator": "MediaAuthenticityVerifier/0.1",
-        "claim_generator_info": [{
-            "name" : "MediaAuthenticityVerifier/0.1",
-            "version" : "0.1"
-        }],
-        "format" : format,
-        "ingredients" : [],
-        "assertions" : [{
-            "label" : "c2pa.actions",
-            "data": {
-                "actions": [{
-                    "action" : "c2pa.created",
-                    "softwareAgent": {
-                        "name": "Media-Verification-Tool",
-                        "version": "0.1"
-                    }
-                }]
-            }
-        }]
-    }
+def create_manifest(format:str, title:str, existing:bool):
+    now = datetime.now()
+    
+    if existing:
+        #TODO: implement logic to extract existing xmp instance id. For now, generating new on upload
+        instance_id = f"xmp:iid:{uuid.uuid4()}"
+        manifest_definition = {
+            "claim_generator": "MediaAuthenticityVerifier/0.1",
+            "claim_generator_info": [{
+                "name" : "MediaAuthenticityVerifier/0.1",
+                "version" : "0.1"
+            }],
+            "format" : format,
+            "ingredients" : [{
+                "title": title,
+                "format": format,
+                "relationship" : "parentOf",
+                "instance_id": instance_id
+            }],
+            "assertions" : [{
+                "label" : "c2pa.actions",
+                "data": {
+                    "actions": [{
+                        "action" : "c2pa.opened",
+                        "parameters" : {
+                            "ingredientIds": instance_id
+                        },
+                        "when": str(now.date()) + "T" + str(now.strftime("%H:%M:%S"))+ "Z",
+                        "softwareAgent": {
+                            "name": "Media-Verification-Tool",
+                            "version": "0.1"
+                        },
+                        #TODO: Implement logic to check if the media came from a trusted source and also implement origin
+                        "digitalSourceType": ""
+                    }]
+                }
+            }]
+        }
+    else:
+        manifest_definition = {
+            "claim_generator": "MediaAuthenticityVerifier/0.1",
+            "claim_generator_info": [{
+                "name" : "MediaAuthenticityVerifier/0.1",
+                "version" : "0.1"
+            }],
+            "format" : format,
+            "ingredients" : [],
+            "assertions" : [{
+                "label" : "c2pa.actions",
+                "data": {
+                    "actions": [{
+                        "action" : "c2pa.created",
+                        "when": now.date + "T" + now.strftime("%H:%M:%S")+ "Z",
+                        "softwareAgent": {
+                            "name": "Media-Verification-Tool",
+                            "version": "0.1"
+                        },
+                        #TODO: Implement logic to check if the media came from a trusted source or algorithmically generated and also implement origin
+                        "digitalSourceType": "https://cv.iptc.org/newscodes/digitalsourcetype/digitalCapture"
+                    }]
+                }
+            }]
+        }
 
     return manifest_definition
 
@@ -50,7 +93,7 @@ def callback_signer_es256(data: bytes) -> bytes:
     )
     return signature
 
-def sign_img(input, format: str) -> bytes:
+def sign_img(input, format: str, f_name:str, existing:bool) -> bytes:
     if isinstance(input, (bytes, bytearray)):
         input = io.BytesIO(bytes(input))
     if hasattr(input, "seek"):
@@ -66,12 +109,9 @@ def sign_img(input, format: str) -> bytes:
         signer_kwargs["tsa_url"] = TSA_URL
 
     with c2pa.Signer.from_callback(**signer_kwargs) as signer:
-        with c2pa.Builder(create_manifest(format)) as builder:
+        with c2pa.Builder(create_manifest(format, f_name, existing)) as builder:
             builder.sign(
-                source=input,
-                dest=output,
-                signer=signer,
-                format=format
+                signer,format,input,output
             )
             output.seek(0)
             return output.read()

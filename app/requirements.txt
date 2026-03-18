@@ -5,3 +5,5 @@ sqlalchemy
 psycopg2-binary
 minio
 python-dotenv
+c2pa-python
+uuid

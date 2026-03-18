@@ -6,5 +6,4 @@ import os
 load_dotenv()
 
 engine = create_engine(os.getenv("POSTGRESDB_URL"))
-
 SessionLocal = sessionmaker(autocommit = False, autoflush = False, bind = engine)

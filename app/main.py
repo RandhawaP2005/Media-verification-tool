@@ -6,9 +6,11 @@ from uuid import uuid4
 from dotenv import load_dotenv
 from database import  engine, SessionLocal
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from database_models import MediaRecord, Base
 from hashlib import sha256
-from metadata_handler import sign_img, get_manifest, get_validation_diagnostics
+from metadata_handler import sign_img, get_manifest
+from datetime import datetime
 import os, io
 
 load_dotenv()
@@ -16,6 +18,23 @@ load_dotenv()
 app = FastAPI()
 
 Base.metadata.create_all(bind=engine)
+
+
+def reconcile_schema() -> None:
+    # `create_all()` will not remove an existing unique constraint, so fix the
+    # legacy schema explicitly on startup.
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                ALTER TABLE media_authenticity
+                DROP CONSTRAINT IF EXISTS media_authenticity_bucket_key
+                """
+            )
+        )
+
+
+reconcile_schema()
 
 client = Minio(
     endpoint= os.getenv('MINIO_CLIENT_END_POINT'),
@@ -48,81 +67,95 @@ def get_sha256_hash(download) -> str:
     return h.hexdigest()
 
 def get_img(bucket_name:str, object_name:str) -> bytes:
+    response = None
     try:
         response = client.get_object(bucket_name=bucket_name, object_name=object_name)
         return response.read()
-    except S3Error as e:
-        raise RuntimeError(f"Minio get object failed: {e.code} {e.message}") from e
     finally:
         if response:
             response.close()
             response.release_conn()
 
 
-def normalize_c2pa_format(content_type: str) -> str:
-    # c2pa format expects standard mime values (e.g. image/jpeg, not image/jpg)
-    if content_type == "image/jpg":
-        return "image/jpeg"
-    return content_type
-
-
-
 @app.post("/upload/image")
 async def upload_image(file: UploadFile, db:Session = Depends(get_db)):
-    img_types = ["image/png", "image/jpeg", "image/jpg", "image/heic"]
+    img_types = ["image/png", "image/jpeg", "image/heic"]
 
     if file.content_type not in img_types:
-        return HTTPException(400, detail= f"Unsupported file type: {file.content_type}")
+        raise HTTPException(400, detail= f"Unsupported file type: {file.content_type}")
     else:
+        f_type = file.content_type
         ext = ""
         for img_type in img_types:
-            if img_type == file.content_type:
+            if img_type == f_type:
                 ext = img_type.removeprefix("image/")
                 break
         
-        #Create unique image_id
-        image_id = uuid4()
-        object_key = f"test/2026/02/{image_id}.{ext}" # test and date is placeholder until user is defined
+        try: 
+            raw_bytes = await file.read()
+            if not raw_bytes:
+                raise HTTPException(status_code=400, detail="Empty Upload")
 
-        client.put_object(
-            bucket_name= "test",
-            object_name= object_key,
-            data= file.file,
-            length= file.size,
-            content_type= file.content_type
-        )
+            #Create unique image_id
+            raw_image_id = uuid4()
+            bucket_name = "test"
+            object_key = f"{raw_image_id}.{ext}" # test and date is placeholder until user is defined
 
-        minio_file = get_img(bucket_name="test", object_name=object_key)
+            client.put_object(
+                bucket_name= "test",
+                object_name= object_key,
+                data= io.BytesIO(raw_bytes),
+                length= len(raw_bytes),
+                content_type= f_type
+            )
 
-        c2pa_format = normalize_c2pa_format(file.content_type)
-        signed_minio_file = sign_img(format=c2pa_format, input=io.BytesIO(minio_file))
+            db.add(MediaRecord(
+                image_id = raw_image_id,
+                bucket = bucket_name,
+                object_key = object_key,
+                sha256_bytes = get_sha256_hash(io.BytesIO(raw_bytes)),
+                c2pa_status = "unsigned",
+                c2pa_claim_generator = "Media-Verification-Tool"
+            ))
 
-        client.put_object(
-            bucket_name = "test",
-            object_name= f"test/2026/02/{image_id}_signed.{ext}",
-            data = io.BytesIO(signed_minio_file),
-            length = len(signed_minio_file),
-            content_type = file.content_type
-        )
+            minio_file = get_img(bucket_name="test", object_name=object_key)
+            signed_bytes = sign_img(format=f_type, input=io.BytesIO(minio_file), f_name= object_key, existing=True)
+            signed_image_id = uuid4()
+            signed_object_name = f"{signed_image_id}_signed.{ext}"
 
-        manifest = get_manifest(io.BytesIO(signed_minio_file), c2pa_format)
-        diagnostics = get_validation_diagnostics(io.BytesIO(signed_minio_file), c2pa_format)
-        print({"manifest": manifest, "diagnostics": diagnostics})
-        #
-        #db.add(MediaRecord(
-        #   image_id=image_id,
-        #    bucket="test",
-        #    object_key=object_key,
-        #    sha256_bytes=minio_file_hash,
-        #))
+            client.put_object(
+                bucket_name = bucket_name,
+                object_name= signed_object_name,
+                data = io.BytesIO(signed_bytes),
+                length = len(signed_bytes),
+                content_type = f_type
+            )
 
-        db.commit()
+            manifest = get_manifest(io.BytesIO(signed_bytes), f_type)
+            print({"manifest": manifest})
+            db.add(MediaRecord(
+                image_id=signed_image_id,
+                bucket="test",
+                object_key=signed_object_name,
+                sha256_bytes=get_sha256_hash(io.BytesIO(signed_bytes)),
+                c2pa_status = "signed",
+                c2pa_claim_generator = "Media-Verification-Tool",
+                manifest_json = manifest,
+                parent_image_id = raw_image_id
+            ))
 
-        return {
-            "message": "Upload successful.",
-            "signed_object_key": f"test/2026/02/{image_id}_signed.{ext}",
-            "integrity_valid": diagnostics.get("integrity_valid"),
-            "trust_valid": diagnostics.get("trust_valid"),
-            "manifest": manifest,
-            "diagnostics": diagnostics,
-        }
+            db.commit()
+
+            return {
+               "raw_image_id": str(raw_image_id),
+               "signed_image_id": str(signed_image_id)
+            }
+
+        except HTTPException:
+            db.rollback()
+            raise
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"Upload/sign failed: {str(e)}")
+
+#@app.post("")
