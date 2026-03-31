@@ -7,6 +7,7 @@ import os
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.backends import default_backend
+from sqlalchemy import exc
 
 with open("cert.pem", "rb") as cert_file:
     certs = cert_file.read()
@@ -128,6 +129,35 @@ def get_manifest(input, format) -> json:
                 return active_manifest
             else:
                 print("Error: No Manifest Attached to file.")
+
+    except Exception as err:
+        print(err)
+
+
+def verify_img(input, format:str):
+    try:
+        if isinstance(input, (bytes, bytearray)):
+            input = io.BytesIO(bytes(input))
+        if hasattr(input, "seek"):
+            input.seek(0)
+        
+        settings_dict = {
+        "verify": {
+            "verify_cert_anchors": True
+            }
+        }
+
+        settings = c2pa.Settings.from_dict(settings_dict)
+        with c2pa.Context(settings) as ctx:
+            with c2pa.Reader(format, input) as reader:
+                manifest_store = reader.json()
+
+                return {
+                    "manifest_store" : manifest_store,
+                    "active_manifest" : reader.get_active_manifest,
+                    "validation_state" : reader.get_validation_state,
+                    "validation_results" : reader.get_validation_results
+                }
 
     except Exception as err:
         print(err)
