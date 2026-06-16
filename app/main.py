@@ -1,17 +1,20 @@
 from fastapi import FastAPI,UploadFile, Depends
 from fastapi.exceptions import HTTPException
+from fastapi.responses import StreamingResponse
 from minio import Minio
 from minio.error import S3Error
-from uuid import uuid4
+from uuid import uuid4, UUID
 from dotenv import load_dotenv
+from test_c2palib import file
 from database import  engine, SessionLocal
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from database_models import MediaRecord, Base
 from hashlib import sha256
-from metadata_handler import sign_img, get_manifest
+from metadata_handler import sign_img, get_manifest, verify_img
 from datetime import datetime
 import os, io
+from io import BytesIO
 
 load_dotenv()
 
@@ -19,10 +22,7 @@ app = FastAPI()
 
 Base.metadata.create_all(bind=engine)
 
-
 def reconcile_schema() -> None:
-    # `create_all()` will not remove an existing unique constraint, so fix the
-    # legacy schema explicitly on startup.
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -52,7 +52,7 @@ def get_db():
     try:
         yield db
     finally:
-        db.close
+        db.close()
 
 def get_sha256_hash(download) -> str:
     h = sha256()
@@ -158,4 +158,104 @@ async def upload_image(file: UploadFile, db:Session = Depends(get_db)):
             db.rollback()
             raise HTTPException(status_code=500, detail=f"Upload/sign failed: {str(e)}")
 
-#@app.post("")
+@app.post("/upload/verify")
+async def verify_upload(file: UploadFile, db:Session = Depends(get_db)):
+    img_types = ["image/png", "image/jpeg", "image/heic"]
+
+    if file.content_type not in img_types:
+        raise HTTPException(400, detail= f"Unsupported file type: {file.content_type}")
+
+    f_type = file.content_type
+
+    try: 
+        raw_bytes = await file.read()
+        if not raw_bytes:
+            raise HTTPException(status_code=400, detail="Empty Upload")
+
+        manifest = get_manifest(raw_bytes, f_type)
+        if not manifest:
+            raise HTTPException(status_code=400, detail="Missing C2PA manifest")
+
+        verification_data = verify_img(raw_bytes, f_type)
+        if not verification_data:
+            raise HTTPException(status_code=400, detail="Unable to verify C2PA manifest")
+
+        computed_sha = get_sha256_hash(io.BytesIO(raw_bytes))
+        record = db.query(MediaRecord).filter_by(sha256_bytes=computed_sha).first()
+        manifest_store = verification_data["manifest_store"]
+        active_manifest_id = manifest_store.get("active_manifest")
+        active_manifest = manifest_store.get("manifests", {}).get(active_manifest_id, {})
+        claim_generator = active_manifest.get("claim_generator")
+
+        expected_claim_generator = None
+        if record and record.manifest_json:
+            expected_claim_generator = record.manifest_json.get("claim_generator")
+        if record and not expected_claim_generator:
+            expected_claim_generator = record.c2pa_claim_generator
+
+        matching_record = bool(record)
+        mismatch_reasons = []
+        if record and expected_claim_generator != claim_generator:
+            matching_record = False
+            mismatch_reasons.append("claim_generator")
+
+        validation_state = verification_data.get("validation_state")
+        signature_valid = str(validation_state).lower() == "valid"
+        if record:
+            record.c2pa_signature_valid = signature_valid
+            db.commit()
+
+        return {
+            "sha256": computed_sha,
+            "has_manifest": True,
+            "known_to_system": bool(record),
+            "matching_record": matching_record,
+            "mismatch_reasons": mismatch_reasons,
+            "c2pa": {
+                "active_manifest": active_manifest_id,
+                "claim_generator": claim_generator,
+                "validation_state": validation_state,
+                "validation_results": verification_data.get("validation_results"),
+                "signature_valid": signature_valid
+            },
+            "record": {
+                "image_id": str(record.image_id),
+                "object_key": record.object_key,
+                "c2pa_status": record.c2pa_status,
+                "expected_claim_generator": expected_claim_generator
+            } if record else None
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Verification failed: {str(e)}")
+
+def read_img(file) -> BytesIO:
+    return BytesIO(file)
+
+@app.get("/image/{image_id}/download", response_class=StreamingResponse)
+async def download_signed_img(image_id: UUID, db:Session = Depends(get_db)):
+    record = db.query(MediaRecord).filter(MediaRecord.image_id == image_id).first()
+
+    if not record:
+        raise HTTPException(status_code=404,detail="Image not found.")
+
+    if record.c2pa_status != "signed":
+        raise HTTPException(status_code=400,detail="requested image is not signed.")
+
+    file_bytes = get_img("test", record.object_key)
+    file_name = record.object_key.split("/")[-1]
+
+    def iter_file():
+        with read_img(file_bytes) as img_file:
+            yield from img_file
+
+    return StreamingResponse(
+        iter_file(),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{file_name}"'}
+    )
+

@@ -15,7 +15,7 @@ class MediaRecord(Base):
     sha256_bytes = Column(String(64))
     #status= Column(String, nullable=False, default="queued")
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    c2pa_status = Column(String, nullable = False, default="unsigned"),
+    c2pa_status = Column(String, nullable = False, default="unsigned")
     c2pa_claim_generator = Column(String)
     c2pa_signature_valid = Column(Boolean, nullable = True)
     manifest_json = Column(JSONB, nullable=True)

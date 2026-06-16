@@ -7,7 +7,6 @@ import os
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.backends import default_backend
-from sqlalchemy import exc
 
 with open("cert.pem", "rb") as cert_file:
     certs = cert_file.read()
@@ -134,6 +133,22 @@ def get_manifest(input, format) -> json:
         print(err)
 
 
+def _resolve_reader_value(value):
+    if callable(value):
+        return value()
+    return value
+
+
+def _json_safe(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
 def verify_img(input, format:str):
     try:
         if isinstance(input, (bytes, bytearray)):
@@ -150,13 +165,13 @@ def verify_img(input, format:str):
         settings = c2pa.Settings.from_dict(settings_dict)
         with c2pa.Context(settings) as ctx:
             with c2pa.Reader(format, input) as reader:
-                manifest_store = reader.json()
+                manifest_store = json.loads(reader.json())
 
                 return {
                     "manifest_store" : manifest_store,
-                    "active_manifest" : reader.get_active_manifest,
-                    "validation_state" : reader.get_validation_state,
-                    "validation_results" : reader.get_validation_results
+                    "active_manifest" : _json_safe(_resolve_reader_value(reader.get_active_manifest)),
+                    "validation_state" : _json_safe(_resolve_reader_value(reader.get_validation_state)),
+                    "validation_results" : _json_safe(_resolve_reader_value(reader.get_validation_results))
                 }
 
     except Exception as err:
