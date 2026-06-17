@@ -5,13 +5,12 @@ from minio import Minio
 from minio.error import S3Error
 from uuid import uuid4, UUID
 from dotenv import load_dotenv
-from test_c2palib import file
 from database import  engine, SessionLocal
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from database_models import MediaRecord, Base
 from hashlib import sha256
-from metadata_handler import sign_img, get_manifest, verify_img
+from metadata_handler import CLAIM_GENERATOR, sign_img, get_manifest, verify_img
 from datetime import datetime
 import os, io
 from io import BytesIO
@@ -77,6 +76,18 @@ def get_img(bucket_name:str, object_name:str) -> bytes:
             response.release_conn()
 
 
+def get_claim_generator(manifest: dict) -> str | None:
+    claim_generator = manifest.get("claim_generator")
+    if claim_generator:
+        return claim_generator
+
+    claim_generator_info = manifest.get("claim_generator_info") or []
+    if claim_generator_info:
+        return claim_generator_info[0].get("name")
+
+    return None
+
+
 @app.post("/upload/image")
 async def upload_image(file: UploadFile, db:Session = Depends(get_db)):
     img_types = ["image/png", "image/jpeg", "image/heic"]
@@ -115,7 +126,7 @@ async def upload_image(file: UploadFile, db:Session = Depends(get_db)):
                 object_key = object_key,
                 sha256_bytes = get_sha256_hash(io.BytesIO(raw_bytes)),
                 c2pa_status = "unsigned",
-                c2pa_claim_generator = "Media-Verification-Tool"
+                c2pa_claim_generator = CLAIM_GENERATOR
             ))
 
             minio_file = get_img(bucket_name="test", object_name=object_key)
@@ -139,7 +150,7 @@ async def upload_image(file: UploadFile, db:Session = Depends(get_db)):
                 object_key=signed_object_name,
                 sha256_bytes=get_sha256_hash(io.BytesIO(signed_bytes)),
                 c2pa_status = "signed",
-                c2pa_claim_generator = "Media-Verification-Tool",
+                c2pa_claim_generator = CLAIM_GENERATOR,
                 manifest_json = manifest,
                 parent_image_id = raw_image_id
             ))
@@ -185,11 +196,11 @@ async def verify_upload(file: UploadFile, db:Session = Depends(get_db)):
         manifest_store = verification_data["manifest_store"]
         active_manifest_id = manifest_store.get("active_manifest")
         active_manifest = manifest_store.get("manifests", {}).get(active_manifest_id, {})
-        claim_generator = active_manifest.get("claim_generator")
+        claim_generator = get_claim_generator(active_manifest)
 
         expected_claim_generator = None
         if record and record.manifest_json:
-            expected_claim_generator = record.manifest_json.get("claim_generator")
+            expected_claim_generator = get_claim_generator(record.manifest_json)
         if record and not expected_claim_generator:
             expected_claim_generator = record.c2pa_claim_generator
 
@@ -233,6 +244,7 @@ async def verify_upload(file: UploadFile, db:Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Verification failed: {str(e)}")
 
+
 def read_img(file) -> BytesIO:
     return BytesIO(file)
 
@@ -258,4 +270,6 @@ async def download_signed_img(image_id: UUID, db:Session = Depends(get_db)):
         media_type="application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{file_name}"'}
     )
+
+
 

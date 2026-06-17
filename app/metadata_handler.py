@@ -13,6 +13,7 @@ with open("cert.pem", "rb") as cert_file:
 with open("signing.key", "rb") as key_file:
     key = key_file.read()
 TSA_URL = os.getenv("C2PA_TSA_URL")
+CLAIM_GENERATOR = "MediaAuthenticityVerifier/0.1"
 
 def create_manifest(format:str, title:str, existing:bool):
     now = datetime.now()
@@ -21,9 +22,10 @@ def create_manifest(format:str, title:str, existing:bool):
         #TODO: implement logic to extract existing xmp instance id. For now, generating new on upload
         instance_id = f"xmp:iid:{uuid.uuid4()}"
         manifest_definition = {
-            "claim_generator": "MediaAuthenticityVerifier/0.1",
+            "alg" : "sha256",
+            "claim_generator" : CLAIM_GENERATOR,
             "claim_generator_info": [{
-                "name" : "MediaAuthenticityVerifier/0.1",
+                "name" : CLAIM_GENERATOR,
                 "version" : "0.1"
             }],
             "format" : format,
@@ -54,9 +56,9 @@ def create_manifest(format:str, title:str, existing:bool):
         }
     else:
         manifest_definition = {
-            "claim_generator": "MediaAuthenticityVerifier/0.1",
+            "claim_generator": CLAIM_GENERATOR,
             "claim_generator_info": [{
-                "name" : "MediaAuthenticityVerifier/0.1",
+                "name" : CLAIM_GENERATOR,
                 "version" : "0.1"
             }],
             "format" : format,
